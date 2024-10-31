@@ -1,3 +1,6 @@
+;; Experience Token Economy Smart Contract
+;; A fungible token system for the travel industry
+
 ;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant token-name "Experience Token")
@@ -8,8 +11,14 @@
 (define-constant err-not-enough-stake (err u102))
 (define-constant err-invalid-partner (err u103))
 (define-constant err-already-voted (err u104))
+(define-constant err-invalid-amount (err u105))
+(define-constant err-invalid-recipient (err u106))
+(define-constant err-invalid-points (err u107))
+(define-constant err-overflow (err u108))
 (define-constant minimum-stake-amount u1000)
 (define-constant reward-cooldown-period u144) ;; ~24 hours in blocks
+(define-constant maximum-supply u1000000000000) ;; 1 trillion tokens
+(define-constant maximum-multiplier u1000) ;; 10x multiplier max
 
 ;; Data Variables
 (define-data-var total-supply uint u0)
@@ -26,6 +35,20 @@
 
 ;; SFT Definition
 (define-fungible-token exp-token)
+
+;; Helper Functions
+(define-private (check-amount (amount uint))
+    (and (> amount u0) 
+         (< (+ amount (var-get total-supply)) maximum-supply)))
+
+(define-private (check-recipient (recipient principal))
+    (not (is-eq recipient (as-contract tx-sender))))
+
+(define-private (check-points (points uint))
+    (and (> points u0) (< points u1000000))) ;; Reasonable points limit
+
+(define-private (check-multiplier (multiplier uint))
+    (and (>= multiplier u1) (<= multiplier maximum-multiplier)))
 
 ;; Read-only functions
 (define-read-only (get-name)
@@ -55,12 +78,16 @@
 (define-public (mint (amount uint) (recipient principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (check-amount amount) err-invalid-amount)
+        (asserts! (check-recipient recipient) err-invalid-recipient)
         (try! (ft-mint? exp-token amount recipient))
         (var-set total-supply (+ (var-get total-supply) amount))
         (ok true)))
 
 (define-public (burn (amount uint))
     (begin
+        (asserts! (check-amount amount) err-invalid-amount)
+        (asserts! (<= amount (var-get total-supply)) err-invalid-amount)
         (try! (ft-burn? exp-token amount tx-sender))
         (var-set total-supply (- (var-get total-supply) amount))
         (ok true)))
@@ -68,15 +95,22 @@
 ;; Travel Activity and Rewards
 (define-public (earn-from-activity (points uint))
     (let ((current-points (default-to u0 (map-get? user-travel-points tx-sender)))
-          (season-adjusted-points (* points (var-get season-multiplier))))
+          (multiplier (var-get season-multiplier)))
         (begin
-            (map-set user-travel-points tx-sender (+ current-points season-adjusted-points))
-            (try! (mint season-adjusted-points tx-sender))
-            (ok true))))
+            (asserts! (check-points points) err-invalid-points)
+            (asserts! (check-multiplier multiplier) err-invalid-amount)
+            (let ((season-adjusted-points (/ (* points multiplier) u100)))
+                (asserts! (check-amount season-adjusted-points) err-overflow)
+                (map-set user-travel-points 
+                    tx-sender 
+                    (+ current-points season-adjusted-points))
+                (try! (mint season-adjusted-points tx-sender))
+                (ok true)))))
 
 (define-public (book-experience (partner principal) (cost uint))
     (begin
         (asserts! (is-partner partner) err-invalid-partner)
+        (asserts! (check-amount cost) err-invalid-amount)
         (try! (ft-transfer? exp-token cost tx-sender partner))
         (ok true)))
 
@@ -84,6 +118,7 @@
 (define-public (stake (amount uint))
     (let ((current-stake (get-stake-info tx-sender)))
         (begin
+            (asserts! (check-amount amount) err-invalid-amount)
             (asserts! (>= amount minimum-stake-amount) err-not-enough-stake)
             (try! (ft-transfer? exp-token amount tx-sender (as-contract tx-sender)))
             (map-set stakes 
@@ -95,6 +130,7 @@
 (define-public (unstake (amount uint))
     (let ((current-stake (get-stake-info tx-sender)))
         (begin
+            (asserts! (check-amount amount) err-invalid-amount)
             (asserts! (>= (get amount current-stake) amount) err-not-enough-stake)
             (try! (as-contract (ft-transfer? exp-token amount (as-contract tx-sender) tx-sender)))
             (map-set stakes
@@ -106,10 +142,11 @@
 ;; Partner Management and Voting
 (define-public (propose-partner (new-partner principal))
     (begin
+        (asserts! (check-recipient new-partner) err-invalid-recipient)
         (asserts! (is-some (map-get? stakes { staker: tx-sender })) err-not-enough-stake)
         (map-set partner-votes 
             { partner: new-partner }
-            { votes: (default-to u0 (get votes (map-get? partner-votes { partner: new-partner }))) })
+            { votes: u0 })
         (ok true)))
 
 (define-public (vote-for-partner (partner principal))
@@ -118,6 +155,7 @@
             { votes: u0 }
             (map-get? partner-votes { partner: partner }))))
         (begin
+            (asserts! (check-recipient partner) err-invalid-recipient)
             (asserts! (>= (get amount stake-info) minimum-stake-amount) err-not-enough-stake)
             (map-set partner-votes
                 { partner: partner }
@@ -127,6 +165,7 @@
 (define-public (add-partner (partner principal))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (check-recipient partner) err-invalid-recipient)
         (map-set partners partner true)
         (ok true)))
 
@@ -134,6 +173,7 @@
 (define-public (set-season-multiplier (multiplier uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (check-multiplier multiplier) err-invalid-amount)
         (var-set season-multiplier multiplier)
         (ok true)))
 
